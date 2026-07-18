@@ -487,10 +487,13 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
       }
     }
 
-    // Si no queda ninguna versión confiable, inferir 6.9.0 como mínimo
+    // Si no queda ninguna versión confiable, marcar como desconocida.
+    // NO inferir 6.9.0: el sitio podría estar parcheado (6.9.5+) y
+    // falsear su versión, como en ifop.cl (reporta 6.6.1 pero batch existe).
     if (!detectedVersion) {
-      detectedVersion = [6, 9, 0];
-      signals.push("Versión inferida mínima: 6.9.0 (basada en la presencia del endpoint batch).");
+      signals.push(
+        "No se pudo determinar la versión exacta. El endpoint batch está presente (WP ≥ 6.9.0), pero no podemos confirmar si el sitio es vulnerable sin conocer la versión real. Verifica manualmente."
+      );
     }
   }
 
