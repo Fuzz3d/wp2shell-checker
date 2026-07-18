@@ -253,8 +253,8 @@ async function detectFromFeed(
 ): Promise<{ version: Version; source: string } | null> {
   const feedUrls = [`${baseUrl}/?feed=rss2`, `${baseUrl}/feed/`];
 
-  for (const url of feedUrls) {
-    try {
+  const results = await Promise.allSettled(
+    feedUrls.map(async (url) => {
       const { body } = await fetchFn(url);
 
       const genMatch = body.match(
@@ -262,18 +262,22 @@ async function detectFromFeed(
       );
       if (genMatch) {
         const version = parseVersion(genMatch[1]);
-        if (version)
-          return { version, source: `feed RSS (${new URL(url).pathname})` };
+        if (version) return { version, source: `feed RSS (${new URL(url).pathname})` };
       }
 
       const generatorMatch = body.match(/<generator>WordPress\s+([\d.-]+)<\/generator>/i);
       if (generatorMatch) {
         const version = parseVersion(generatorMatch[1]);
-        if (version)
-          return { version, source: `feed RSS (${new URL(url).pathname})` };
+        if (version) return { version, source: `feed RSS (${new URL(url).pathname})` };
       }
-    } catch {
-      /* ignored */
+
+      return null;
+    })
+  );
+
+  for (const result of results) {
+    if (result.status === "fulfilled" && result.value) {
+      return result.value;
     }
   }
   return null;
@@ -337,16 +341,17 @@ async function detectFromWpJson(
 
 async function detectMarkers(baseUrl: string, fetchFn: SafeFetch): Promise<string[]> {
   const markerPaths = ["/wp-content/", "/wp-includes/", "/wp-json/", "/wp-admin/"];
-  const found: string[] = [];
-
-  for (const path of markerPaths) {
-    try {
+  const results = await Promise.allSettled(
+    markerPaths.map(async (path) => {
       const { status } = await fetchFn(`${baseUrl}${path}`);
-      if (status !== 404) {
-        found.push(path.replace(/\//g, ""));
-      }
-    } catch {
-      /* ignored */
+      return { path, status };
+    })
+  );
+
+  const found: string[] = [];
+  for (const result of results) {
+    if (result.status === "fulfilled" && result.value.status !== 404) {
+      found.push(result.value.path.replace(/\//g, ""));
     }
   }
 
@@ -374,11 +379,13 @@ async function probeBatchEndpoint(
   if (status === 403) return { accessible: false, status: 403 };
   if (
     status === 200 ||
+    status === 207 ||
     status === 400 ||
     status === 401 ||
     status === 405 ||
     status === 406 ||
-    status === 415
+    status === 415 ||
+    status === 422
   ) {
     return { accessible: true, status };
   }

@@ -99,7 +99,7 @@ async function safeFetch(
 
     if (method === "POST") {
       headers["Content-Type"] = "application/json";
-      fetchOpts.body = "{}";
+      fetchOpts.body = '{"requests":[]}';
     }
 
     const response = await fetch(target.href, fetchOpts as RequestInit);
@@ -120,7 +120,8 @@ async function safeFetch(
       response.status !== 403 &&
       response.status !== 401 &&
       response.status !== 400 &&
-      response.status !== 405
+      response.status !== 405 &&
+      response.status !== 422
     ) {
       throw new Error(`El servidor respondió con estado ${response.status}.`);
     }
