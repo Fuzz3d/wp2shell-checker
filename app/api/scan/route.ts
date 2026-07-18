@@ -99,7 +99,7 @@ async function safeFetch(
 
     if (method === "POST") {
       headers["Content-Type"] = "application/json";
-      fetchOpts.body = '{"requests":[]}';
+      fetchOpts.body = options.body ?? '{"requests":[]}';
     }
 
     const response = await fetch(target.href, fetchOpts as RequestInit);

@@ -273,6 +273,30 @@ export function ScanReport({ result, onRunAgain }: ScanReportProps) {
         <InfoRow icon={Shield} label="Endpoint batch (/wp-json/batch/v1)">
           <BatchStatusBadge result={result} />
         </InfoRow>
+        {result.behavioral && (
+          <InfoRow
+            icon={
+              result.behavioral.vulnerable === true
+                ? ShieldAlert
+                : result.behavioral.vulnerable === false
+                  ? ShieldCheck
+                  : CircleAlert
+            }
+            label="Prueba conductual (SLEEP oracle)"
+          >
+            <span
+              className={
+                result.behavioral.vulnerable === true
+                  ? "text-danger"
+                  : result.behavioral.vulnerable === false
+                    ? "text-success"
+                    : "text-warning"
+              }
+            >
+              {result.behavioral.signal}
+            </span>
+          </InfoRow>
+        )}
       </div>
 
       {/* Evidence */}
