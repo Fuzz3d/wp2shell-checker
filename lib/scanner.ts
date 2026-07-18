@@ -69,6 +69,15 @@ function computeVerdict(version: Version | null, markersFound: boolean, batch: B
     };
   }
 
+  if (markersFound && batchStatus === 401) {
+    return {
+      level: "safe",
+      title: "No vulnerable",
+      detail:
+        "El endpoint batch requiere autenticación. No puede ser explotado sin credenciales, pero actualiza WordPress de todos modos.",
+    };
+  }
+
   if (!version) {
     if (markersFound) {
       if (batchAccessible) {
@@ -503,6 +512,10 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
   if (batch.status === 403) {
     signals.push(
       "El sondeo batch devolvió HTTP 403 (la API batch está bloqueada por un WAF o plugin de seguridad)."
+    );
+  } else if (batch.status === 401) {
+    signals.push(
+      "El endpoint /wp-json/batch/v1 requiere autenticación (HTTP 401). No es explotable sin credenciales."
     );
   } else if (batch.accessible) {
     signals.push(
