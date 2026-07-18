@@ -216,8 +216,19 @@ async function detectAllFromHomepage(
           source: "asset wp-includes (wp-emoji-release.min.js)",
         });
       } else {
-        const first = assetVersions.values().next().value;
-        if (first) versionHits.push({ version: first.version, source: "asset wp-includes" });
+        // Seleccionar la versión más alta entre todos los assets wp-includes
+        // para evitar falsos posititos de plugins/themes con versiones antiguas.
+        let highest: { version: Version; source: string } | null = null;
+        for (const entry of assetVersions.values()) {
+          if (!highest || cmpVersion(entry.version, highest.version) > 0) {
+            highest = entry;
+          }
+        }
+        if (highest)
+          versionHits.push({
+            version: highest.version,
+            source: `asset wp-includes (${highest.source})`,
+          });
       }
     }
 
@@ -423,12 +434,52 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
     }
   }
 
-  const markersFound =
-    markersResult.status === "fulfilled" ? markersResult.value : [];
+  // Sanity check: si el endpoint batch está presente, WordPress es ≥ 6.9.0.
+  // Descartar versiones detectadas < 6.9.0 como falsos posititos de plugins/themes.
   const batch: BatchResult =
     batchResult.status === "fulfilled"
       ? batchResult.value
       : { accessible: false, status: null };
+
+  if (detectedVersion && batch.accessible && versionLt(detectedVersion, [6, 9, 0])) {
+    signals.push(
+      `Versión detectada ${detectedVersion.join(".")} descartada: el endpoint batch está presente, lo que requiere WordPress ≥ 6.9.0.`
+    );
+    detectedVersion = null;
+
+    // Buscar una versión alternativa ≥ 6.9.0 en los resultados de homepage
+    if (homepageResult.status === "fulfilled") {
+      for (const hit of homepageResult.value.versionHits) {
+        if (versionGte(hit.version, [6, 9, 0])) {
+          detectedVersion = hit.version;
+          signals.push(`Versión corregida a ${hit.version.join(".")} (vía ${hit.source}).`);
+          break;
+        }
+      }
+    }
+
+    // Buscar en feed, readme, wp-json
+    if (!detectedVersion) {
+      for (const result of [feedResult, readmeResult, wpJsonResult]) {
+        if (result.status === "fulfilled" && result.value && versionGte(result.value.version, [6, 9, 0])) {
+          detectedVersion = result.value.version;
+          signals.push(
+            `Versión corregida a ${result.value.version.join(".")} (vía ${result.value.source}).`
+          );
+          break;
+        }
+      }
+    }
+
+    // Si no queda ninguna versión confiable, inferir 6.9.0 como mínimo
+    if (!detectedVersion) {
+      detectedVersion = [6, 9, 0];
+      signals.push("Versión inferida mínima: 6.9.0 (basada en la presencia del endpoint batch).");
+    }
+  }
+
+  const markersFound =
+    markersResult.status === "fulfilled" ? markersResult.value : [];
   const wpLogin =
     wpLoginResult.status === "fulfilled" ? wpLoginResult.value : false;
 
