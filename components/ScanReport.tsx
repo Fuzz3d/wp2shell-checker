@@ -90,45 +90,45 @@ function InfoRow({
 function BatchStatusBadge({ result }: { result: ScanResult }) {
   const { batch, verdict } = result;
 
+  if (batch.routeConfusion) {
+    return (
+      <span className="flex items-center gap-2">
+        <span className="font-mono">HTTP 207</span>
+        <span className="text-danger">
+          {"· "}Route confusion detectada — vulnerable
+        </span>
+      </span>
+    );
+  }
+
   if (batch.status === 403) {
     return (
       <span className="flex items-center gap-2">
         <span className="font-mono">HTTP 403</span>
-        <span className="text-success">
+        <span className="text-warning">
           {"· "}Bloqueado por WAF o plugin de seguridad
         </span>
       </span>
     );
   }
 
-  if (batch.accessible) {
-    if (verdict.level === "vulnerable") {
-      return (
-        <span className="flex items-center gap-2">
-          <span className="font-mono">HTTP {batch.status}</span>
-          <span className="text-danger">
-            {"· "}Accesible — superficie explotable
-          </span>
-        </span>
-      );
-    }
-
-    if (verdict.level === "safe") {
-      return (
-        <span className="flex items-center gap-2">
-          <span className="font-mono">HTTP {batch.status}</span>
-          <span className="text-success">
-            {"· "}Accesible, pero el sitio está parcheado
-          </span>
-        </span>
-      );
-    }
-
+  if (batch.status === 401) {
     return (
       <span className="flex items-center gap-2">
-        <span className="font-mono">HTTP {batch.status}</span>
+        <span className="font-mono">HTTP 401</span>
         <span className="text-warning">
-          {"· "}Accesible — podría ser un riesgo potencial
+          {"· "}Requiere autenticación
+        </span>
+      </span>
+    );
+  }
+
+  if (batch.status === 207) {
+    return (
+      <span className="flex items-center gap-2">
+        <span className="font-mono">HTTP 207</span>
+        <span className="text-success">
+          {"· "}Sin route confusion — parcheado
         </span>
       </span>
     );
@@ -239,39 +239,6 @@ export function ScanReport({ result, onRunAgain }: ScanReportProps) {
         </div>
       </div>
 
-      {/* Behavioral safety note */}
-      {result.behavioralWarning && (
-        <div className="mt-3 rounded-lg border border-warning/20 bg-warning/[0.04] p-3">
-          <div className="flex items-start gap-2">
-            <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
-            <div className="text-xs leading-relaxed text-white/70">
-              <strong className="text-warning">Nota sobre la prueba activa:</strong>{" "}
-              Para confirmar la vulnerabilidad, este escáner envía una petición
-              batch anidada al endpoint{" "}
-              <code className="font-mono text-[11px]">/wp-json/batch/v1</code>{" "}
-              con un payload de timing (SLEEP). La prueba está diseñada para
-              ser no destructiva: en sitios vulnerables el payload se desvía
-              vía route-confusion y nunca llega al handler de creación de
-              posts; en sitios parcheados el check de permisos de WordPress
-              rechaza la petición antes de procesar el body.
-              <br />
-              <strong className="text-warning/90">
-                Caso extremo (muy improbable):
-              </strong>{" "}
-              si el sitio tiene un plugin que otorga{" "}
-              <code className="font-mono text-[11px]">create_posts</code> a
-              usuarios anónimos sin otorgar{" "}
-              <code className="font-mono text-[11px]">edit_posts</code>{" "}
-              (ningún plugin conocido hace esto), la prueba podría crear un
-              post <em>auto-draft</em> vacío (invisible, sin título, sin
-              contenido) que WordPress elimina automáticamente tras 7 días. No
-              uses esta herramienta contra sitios que no tienes autorización
-              para escanear.
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Target info */}
       <div className="mt-4 rounded-2xl border border-white/8 bg-white/[0.02] p-5">
         <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
@@ -311,49 +278,9 @@ export function ScanReport({ result, onRunAgain }: ScanReportProps) {
             </span>
           )}
         </InfoRow>
-        <InfoRow icon={Shield} label="Endpoint batch (/wp-json/batch/v1)">
+        <InfoRow icon={Shield} label="Endpoint batch">
           <BatchStatusBadge result={result} />
         </InfoRow>
-        {result.behavioral && (
-          <InfoRow
-            icon={
-              result.behavioral.vulnerable === true
-                ? ShieldAlert
-                : result.behavioral.vulnerable === false
-                  ? ShieldCheck
-                  : CircleAlert
-            }
-            label="Prueba conductual (SLEEP oracle)"
-          >
-            <span
-              className={
-                result.behavioral.vulnerable === true
-                  ? "text-danger"
-                  : result.behavioral.vulnerable === false
-                    ? "text-success"
-                    : "text-warning"
-              }
-            >
-              {result.behavioral.signal}
-              {" · "}
-              <span
-                className={
-                  result.behavioral.confidence === "high"
-                    ? "text-success"
-                    : result.behavioral.confidence === "normal"
-                      ? "text-warning"
-                      : "text-muted-foreground"
-                }
-              >
-                confianza {result.behavioral.confidence === "high"
-                  ? "alta"
-                  : result.behavioral.confidence === "normal"
-                    ? "normal"
-                    : "reducida"}
-              </span>
-            </span>
-          </InfoRow>
-        )}
       </div>
 
       {/* Evidence */}
@@ -452,8 +379,13 @@ function buildReportText(result: ScanResult): string {
       result.batch.status === null
         ? "inalcanzable"
         : `HTTP ${result.batch.status}`
-    } (accesible: ${result.batch.accessible ? "sí" : "no"})`
+    }${result.batch.routeConfusion ? " (route confusion detectada)" : ""}`
   );
+  if (result.batch.markers.length > 0) {
+    lines.push(
+      `Markers:                 ${result.batch.markers.join(", ")}`
+    );
+  }
   lines.push("");
   lines.push("EVIDENCIA");
   lines.push("-".repeat(48));
@@ -467,12 +399,6 @@ function buildReportText(result: ScanResult): string {
     lines.push(`${(i + 1).toString().padStart(2, "0")}. ${s}`)
   );
   lines.push("");
-  if (result.behavioralWarning) {
-    lines.push("NOTA DE SEGURIDAD");
-    lines.push("-".repeat(48));
-    lines.push(result.behavioralWarning);
-    lines.push("");
-  }
   lines.push(
     "Referencia: https://slcyber.io/research-center/wp2shell-pre-authentication-rce-in-wordpress-core"
   );

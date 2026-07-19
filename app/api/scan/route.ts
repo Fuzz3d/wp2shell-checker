@@ -121,7 +121,9 @@ async function safeFetch(
       response.status !== 401 &&
       response.status !== 400 &&
       response.status !== 405 &&
-      response.status !== 422
+      response.status !== 406 &&
+      response.status !== 422 &&
+      response.status !== 500
     ) {
       throw new Error(`El servidor respondió con estado ${response.status}.`);
     }
