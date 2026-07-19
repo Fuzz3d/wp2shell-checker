@@ -231,6 +231,39 @@ export function ScanReport({ result, onRunAgain }: ScanReportProps) {
         </div>
       </div>
 
+      {/* Behavioral safety note */}
+      {result.behavioralWarning && (
+        <div className="mt-3 rounded-lg border border-warning/20 bg-warning/[0.04] p-3">
+          <div className="flex items-start gap-2">
+            <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+            <div className="text-xs leading-relaxed text-white/70">
+              <strong className="text-warning">Nota sobre la prueba activa:</strong>{" "}
+              Para confirmar la vulnerabilidad, este escáner envía una petición
+              batch anidada al endpoint{" "}
+              <code className="font-mono text-[11px]">/wp-json/batch/v1</code>{" "}
+              con un payload de timing (SLEEP). La prueba está diseñada para
+              ser no destructiva: en sitios vulnerables el payload se desvía
+              vía route-confusion y nunca llega al handler de creación de
+              posts; en sitios parcheados el check de permisos de WordPress
+              rechaza la petición antes de procesar el body.
+              <br />
+              <strong className="text-warning/90">
+                Caso extremo (muy improbable):
+              </strong>{" "}
+              si el sitio tiene un plugin que otorga{" "}
+              <code className="font-mono text-[11px]">create_posts</code> a
+              usuarios anónimos sin otorgar{" "}
+              <code className="font-mono text-[11px]">edit_posts</code>{" "}
+              (ningún plugin conocido hace esto), la prueba podría crear un
+              post <em>auto-draft</em> vacío (invisible, sin título, sin
+              contenido) que WordPress elimina automáticamente tras 7 días. No
+              uses esta herramienta contra sitios que no tienes autorización
+              para escanear.
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Target info */}
       <div className="mt-4 rounded-2xl border border-white/8 bg-white/[0.02] p-5">
         <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-wider text-muted-foreground font-medium">
@@ -410,6 +443,12 @@ function buildReportText(result: ScanResult): string {
     lines.push(`${(i + 1).toString().padStart(2, "0")}. ${s}`)
   );
   lines.push("");
+  if (result.behavioralWarning) {
+    lines.push("NOTA DE SEGURIDAD");
+    lines.push("-".repeat(48));
+    lines.push(result.behavioralWarning);
+    lines.push("");
+  }
   lines.push(
     "Referencia: https://slcyber.io/research-center/wp2shell-pre-authentication-rce-in-wordpress-core"
   );

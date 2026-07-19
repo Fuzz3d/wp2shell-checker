@@ -23,6 +23,7 @@ export interface ScanResult {
   wpLogin: boolean;
   remediation: string[];
   behavioral: { vulnerable: boolean | null; signal: string } | null;
+  behavioralWarning: string | null;
 }
 
 export interface SafeFetchResponse {
@@ -449,10 +450,102 @@ function buildNestedBatchPayload(authorNotInValue: string): object {
   };
 }
 
+async function preFlightCheck(
+  baseUrl: string,
+  fetchFn: SafeFetch
+): Promise<{ safe: boolean; reason?: string }> {
+  // ─── SAFETY ANALYSIS — Static review against WordPress 6.9.4 source code
+  //     (class-wp-rest-posts-controller.php, lines 684-728)
+  //
+  // The behavioral check sends a nested batch payload whose outer request is
+  // POST /wp/v2/posts. We must guarantee this cannot create a real post on
+  // the scanned site.
+  //
+  // SCENARIO 1 — Vulnerable WordPress (6.9.0-6.9.4):
+  //   The route-confusion bug deserializes the outer POST /wp/v2/posts as a
+  //   batch request. create_item() is NEVER called. The inner batch executes
+  //   GETs + SLEEP. READ-ONLY. No post created.
+  //
+  // SCENARIO 2 — Patched WordPress + anonymous user (default):
+  //   create_item_permissions_check() runs BEFORE create_item() and calls
+  //   current_user_can( $post_type->cap->create_posts ) at line 711.
+  //   Anonymous user lacks create_posts → WP_Error('rest_cannot_create',
+  //   status=401). create_item() is NEVER called. Body NEVER processed.
+  //   No post created.
+  //
+  // SCENARIO 3 — Patched WordPress + plugin grants edit_posts to anonymous:
+  //   Pre-flight GET /wp-json/wp/v2/posts?context=edit returns 200
+  //   (get_items_permissions_check() at line 164 requires edit_posts for
+  //   context=edit). We ABORT. No payload sent. No post created.
+  //
+  // SCENARIO 4 — Patched WordPress + plugin grants create_posts to anonymous
+  //   WITHOUT granting edit_posts (no known plugin does this; would be a
+  //   severe misconfiguration on its own):
+  //   Pre-flight GET context=edit returns 401 (no edit_posts) → we proceed.
+  //   The nested batch is processed normally (no route confusion, patched).
+  //   The outer POST /wp/v2/posts reaches create_item_permissions_check() →
+  //   current_user_can(create_posts) → TRUE (plugin granted it).
+  //   create_item() runs. prepare_item_for_database() reads the body: our
+  //   body contains {"validation":"normal","requests":[...]} — none of these
+  //   match valid post fields (title, content, excerpt, status, etc.).
+  //   WordPress ignores unknown fields. wp_insert_post() receives a stdClass
+  //   with only post_type set. Result: auto-draft post with:
+  //     • post_title: "" (empty)
+  //     • post_content: "" (empty)
+  //     • post_status: "auto-draft" (NOT public, NOT visible on frontend)
+  //   HTTP 201 returned.
+  //
+  //   NATURE OF THE auto-draft SIDE EFFECT:
+  //     • Status "auto-draft" is invisible on the public frontend.
+  //     • WordPress creates auto-drafts during normal operation (every time
+  //       a user opens the post editor, one is created).
+  //     • wp_delete_auto_drafts() (wp-cron, daily) removes auto-drafts older
+  //       than 7 days.
+  //     • No email, no RSS entry, no cache invalidation triggered.
+  //
+  //   WHY WE CANNOT DETECT THIS WITHOUT REPRODUCING IT:
+  //     There is no REST API endpoint that exposes the current user's
+  //     capabilities. The only way to know if anonymous has create_posts is
+  //     to attempt a create and observe the response. A pre-flight POST
+  //     would itself create the auto-draft we are trying to detect.
+  //     This is a fundamental limitation of the WordPress REST API.
+  //
+  //   MITIGATION:
+  //     • Pre-flight catches scenario 3 (the common misconfiguration).
+  //     • Scenario 4 requires a rare plugin configuration.
+  //     • If scenario 4 occurs, the side effect is one invisible auto-draft
+  //       that self-deletes within 7 days.
+  //     • The user-facing report includes a note explaining this possibility.
+
+  try {
+    const { status } = await fetchFn(
+      `${baseUrl}/wp-json/wp/v2/posts?context=edit`
+    );
+    if (status === 200) {
+      return {
+        safe: false,
+        reason:
+          "El sitio permite edición anónima de posts (context=edit respondió 200). Prueba abortada por seguridad.",
+      };
+    }
+  } catch {
+    /* 401/403 esperado para anónimo sin edit_posts — continuar */
+  }
+
+  return { safe: true };
+}
+
 async function behavioralCheck(
   baseUrl: string,
   fetchFn: SafeFetch
 ): Promise<{ vulnerable: boolean | null; signal: string }> {
+  // Pre-flight de seguridad: no enviar el payload si el sitio permite
+  // edición anónima de posts (escenario 3 del safety analysis).
+  const preFlight = await preFlightCheck(baseUrl, fetchFn);
+  if (!preFlight.safe) {
+    return { vulnerable: null, signal: preFlight.reason ?? "Prueba abortada por seguridad." };
+  }
+
   // Probar ambas rutas: rest_route (usada por el checker oficial) y wp-json
   const batchUrls = [
     `${baseUrl}/?rest_route=/batch/v1/`,
@@ -699,6 +792,16 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
   }
   const remediation = buildRemediation(verdict);
 
+  const behavioralWarning = behavioralResult
+    ? "NOTA DE SEGURIDAD — Prueba conductual: este escáner envió un payload " +
+      "SLEEP anidado al endpoint batch. En sitios vulnerables, el route-confusion " +
+      "desvía el payload y no se crean posts. En sitios parcheados, WordPress " +
+      "rechaza la petición por permisos (anónimo no tiene create_posts). " +
+      "CASO EXTREMO (muy improbable): si el sitio otorga create_posts a anónimos " +
+      "sin edit_posts, la prueba podría crear un post auto-draft vacío (invisible, " +
+      "sin título, sin contenido) que WordPress elimina automáticamente tras 7 días."
+    : null;
+
   return {
     verdict,
     signals,
@@ -709,5 +812,6 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
     wpLogin,
     remediation,
     behavioral: behavioralResult,
+    behavioralWarning,
   };
 }
