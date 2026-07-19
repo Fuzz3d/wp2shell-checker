@@ -45,6 +45,14 @@ const severityConfig = {
     glow: "shadow-glow-success",
     bar: "from-success/60 to-success/0",
   },
+  protected: {
+    label: "Protegido",
+    variant: "warning" as const,
+    icon: Shield,
+    accent: "text-warning",
+    glow: "",
+    bar: "from-warning/60 to-warning/0",
+  },
   unknown: {
     label: "Desconocido",
     variant: "warning" as const,

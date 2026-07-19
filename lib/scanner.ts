@@ -1,6 +1,6 @@
 export type Version = [number, number, number];
 
-export type VerdictLevel = "vulnerable" | "safe" | "unknown";
+export type VerdictLevel = "vulnerable" | "safe" | "protected" | "unknown";
 
 export interface Verdict {
   level: VerdictLevel;
@@ -69,19 +69,19 @@ function computeVerdict(version: Version | null, markersFound: boolean, batch: B
 
   if (markersFound && batchStatus === 403) {
     return {
-      level: "safe",
-      title: "No vulnerable",
+      level: "protected",
+      title: "Protegido por WAF (vulnerabilidad no confirmada)",
       detail:
-        "La API batch está bloqueada (probablemente por un WAF o plugin de seguridad), por lo que no puede ser explotada. Mantén WordPress actualizado de todos modos.",
+        "La API batch está bloqueada por un WAF o plugin de seguridad, por lo que no es explotable en este momento. Sin embargo, la vulnerabilidad podría seguir presente en el código de WordPress. Actualiza de todos modos por precaución.",
     };
   }
 
   if (markersFound && batchStatus === 401) {
     return {
-      level: "safe",
-      title: "No vulnerable",
+      level: "protected",
+      title: "Protegido por autenticación (vulnerabilidad no confirmada)",
       detail:
-        "El endpoint batch requiere autenticación. No puede ser explotado sin credenciales, pero actualiza WordPress de todos modos.",
+        "El endpoint batch requiere autenticación. No es explotable sin credenciales, pero la vulnerabilidad podría seguir presente. Actualiza WordPress de todos modos.",
     };
   }
 
@@ -176,6 +176,15 @@ function buildRemediation(verdict: Verdict): string[] {
       "Si la versión es 6.9.0–6.9.4 o 7.0.0–7.0.1, actualiza inmediatamente.",
       "Instala una regla WAF para bloquear /wp-json/batch/v1 y ?rest_route=/batch/v1.",
       "Vuelve a ejecutar este comprobador una vez confirmada la versión.",
+    ];
+  }
+
+  if (verdict.level === "protected") {
+    return [
+      "Actualiza WordPress a 7.0.2 (o 6.9.5 si estás en la rama 6.9) — el WAF protege la explotación en este momento, pero la vulnerabilidad sigue presente en el código de WordPress.",
+      "Mantén la regla WAF o plugin de seguridad que bloquea /wp-json/batch/v1 y ?rest_route=/batch/v1.",
+      "Verifica periódicamente que el WAF siga activo — si se deshabilita, el sitio quedaría expuesto.",
+      "Considera instalar el plugin »Disable WP REST API« como defensa en profundidad.",
     ];
   }
 
