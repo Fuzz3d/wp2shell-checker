@@ -22,7 +22,11 @@ export interface ScanResult {
   batch: BatchResult;
   wpLogin: boolean;
   remediation: string[];
-  behavioral: { vulnerable: boolean | null; signal: string } | null;
+  behavioral: {
+    vulnerable: boolean | null;
+    signal: string;
+    confidence: "high" | "normal" | "reduced";
+  } | null;
   behavioralWarning: string | null;
 }
 
@@ -538,12 +542,12 @@ async function preFlightCheck(
 async function behavioralCheck(
   baseUrl: string,
   fetchFn: SafeFetch
-): Promise<{ vulnerable: boolean | null; signal: string }> {
+): Promise<{ vulnerable: boolean | null; signal: string; confidence: "high" | "normal" | "reduced" }> {
   // Pre-flight de seguridad: no enviar el payload si el sitio permite
   // edición anónima de posts (escenario 3 del safety analysis).
   const preFlight = await preFlightCheck(baseUrl, fetchFn);
   if (!preFlight.safe) {
-    return { vulnerable: null, signal: preFlight.reason ?? "Prueba abortada por seguridad." };
+    return { vulnerable: null, confidence: "reduced", signal: preFlight.reason ?? "Prueba abortada por seguridad." };
   }
 
   // Probar ambas rutas: rest_route (usada por el checker oficial) y wp-json
@@ -574,6 +578,7 @@ async function behavioralCheck(
         if (status === 403 || status === 401) {
           return {
             vulnerable: false,
+            confidence: "reduced",
             signal: `Prueba conductual: el WAF bloqueó el payload de prueba en ${url} (HTTP ${status}). El endpoint batch no es explotable desde esta red.`,
           };
         }
@@ -583,76 +588,193 @@ async function behavioralCheck(
     }
     return {
       vulnerable: null,
+      confidence: "reduced",
       signal:
         "Prueba conductual no disponible: ninguna de las rutas batch aceptó las peticiones. Posible WAF o timeout de red bloqueando el escaneo.",
     };
   }
 
-  const takeSample = async (sleepSec: number): Promise<{ time: number | null; blocked: boolean }> => {
-    const value = `0) OR SLEEP(${sleepSec})-- -`;
-    const body = JSON.stringify(buildNestedBatchPayload(value));
-    const t0 = Date.now();
-    try {
-      const { status } = await fetchFn(workingUrl!, { method: "POST", body });
-      if (status === 403 || status === 401) {
-        return { time: null, blocked: true };
+  const takeSamples = async (
+    sleepSec: number,
+    count: number
+  ): Promise<{ times: number[]; blocked: boolean }> => {
+    const times: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const value = `0) OR SLEEP(${sleepSec})-- -`;
+      const body = JSON.stringify(buildNestedBatchPayload(value));
+      const t0 = Date.now();
+      try {
+        const { status } = await fetchFn(workingUrl!, { method: "POST", body });
+        if (status === 403 || status === 401) {
+          return { times, blocked: true };
+        }
+        times.push(Date.now() - t0);
+      } catch {
+        // network error, skip this sample
       }
-      return { time: Date.now() - t0, blocked: false };
-    } catch {
-      return { time: null, blocked: false };
     }
+    return { times, blocked: false };
   };
 
-  // Warm-up de conexión (absorbe overhead TLS/DNS, no cuenta para el delta)
-  await takeSample(0);
+  // Warm-up de conexión (absorbe overhead TLS/DNS)
+  await takeSamples(0, 1);
 
-  // 1 muestra baseline SLEEP(0) + 1 muestra inyectada SLEEP(3)
-  // Reducido a 1+1 para caber dentro del timeout de 30s de Vercel
-  const baseResult = await takeSample(0);
-  if (baseResult.blocked) {
+  // Adaptativo: si la red es muy lenta (>5s para SLEEP(0)), reducir
+  // muestras para no exceder el timeout de 30s de Vercel.
+  const probe = await takeSamples(0, 1);
+  const slowNetwork =
+    probe.times.length > 0 && probe.times[0] > 5000;
+  const sampleCount = slowNetwork ? 1 : 2;
+
+  // ─── Ronda 1: baseline SLEEP(0) vs SLEEP(3) ───────────────────────
+  const base1 = await takeSamples(0, sampleCount);
+  if (base1.blocked) {
     return {
       vulnerable: null,
+      confidence: "reduced",
       signal:
         "Prueba conductual: el WAF bloqueó la petición de referencia (SLEEP pattern detectado). Prueba abortada.",
     };
   }
-  if (baseResult.time === null) {
+  if (base1.times.length < (sampleCount > 1 ? 2 : 1)) {
     return {
       vulnerable: null,
+      confidence: "reduced",
       signal:
-        "Prueba conductual no disponible: la petición de referencia (SLEEP 0) falló. Posible WAF o timeout de red.",
+        "Prueba conductual no disponible: muestras de referencia insuficientes.",
     };
   }
+  const base1Median = median(base1.times);
 
-  const injectResult = await takeSample(3);
-  if (injectResult.blocked) {
+  const sleep3 = await takeSamples(3, sampleCount);
+  if (sleep3.blocked) {
     return {
       vulnerable: null,
+      confidence: "reduced",
       signal:
-        "El WAF bloqueó el payload con patrón SQLi (SLEEP(3)-- -). El batch endpoint es parcialmente accesible pero los payloads de inyección son filtrados. El sitio podría estar protegido por WAF.",
+        "El WAF bloqueó el payload con patrón SQLi (SLEEP(3)-- -). El batch endpoint es parcialmente accesible pero los payloads de inyección son filtrados.",
     };
   }
-  if (injectResult.time === null) {
+  if (sleep3.times.length < (sampleCount > 1 ? 2 : 1)) {
     return {
       vulnerable: null,
+      confidence: "reduced",
       signal:
-        "Prueba conductual no disponible: la petición de inyección (SLEEP 3) falló. Posible WAF o timeout de red.",
+        "Prueba conductual no disponible: muestras SLEEP(3) insuficientes.",
     };
   }
+  const sleep3Median = median(sleep3.times);
 
-  const delta = (injectResult.time - baseResult.time) / 1000;
+  const delta1 = (sleep3Median - base1Median) / 1000;
+
+  // THRESHOLD RATIONALE (2.0s):
+  // SLEEP(3) on a vulnerable site adds ~3s to response time.
+  // Network RTT (Vercel → target) is typically 0.1-1.0s.
+  // Server processing adds ~0.1-0.5s.
+  // So baseline SLEEP(0) ≈ 0.2-1.5s, SLEEP(3) ≈ 3.2-4.5s → delta ≈ 2-4s.
+  // On non-vulnerable sites SLEEP is ignored → delta ≈ 0s.
+  // 2.0s threshold has margin: >0s (safe) and <2s (vuln minimum).
+  // If production shows false negatives, lower to 1.5s.
+  // If false positives from heavy jitter, raise to 2.5s.
   const threshold = 2.0;
 
-  if (delta >= threshold) {
+  // ─── Ronda 2: re-baseline + SLEEP(6) para confirmación escalar ───
+  // Re-baseline normaliza contra condiciones de red actuales (carga,
+  // rate-limiting, jitter) en vez de asumir que son iguales que hace 10s.
+  const base2 = await takeSamples(0, sampleCount);
+  if (base2.times.length < (sampleCount > 1 ? 2 : 1)) {
+    // No se pudo completar la ronda de confirmación. Reportar ronda 1
+    // con confianza normal, sin confirmación.
+    if (delta1 >= threshold) {
+      return {
+        vulnerable: true,
+        confidence: "normal",
+        signal: `[confianza normal — ${sampleCount} muestra(s)] Prueba conductual POSITIVA: SLEEP(3) tardó ${(sleep3Median / 1000).toFixed(1)}s vs ${(base1Median / 1000).toFixed(1)}s de referencia (Δ=${delta1.toFixed(1)}s, umbral ${threshold}s). Confirmación SLEEP(6) no disponible — red lenta.`,
+      };
+    }
     return {
-      vulnerable: true,
-      signal: `[confianza reducida — muestra única] Prueba conductual POSITIVA: SLEEP(3) tardó ${(injectResult.time / 1000).toFixed(1)}s vs ${(baseResult.time / 1000).toFixed(1)}s de referencia (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio ES vulnerable.`,
+      vulnerable: null,
+      confidence: "reduced",
+      signal:
+        "Prueba conductual no disponible: no se pudo completar la ronda de confirmación.",
+    };
+  }
+  const base2Median = median(base2.times);
+
+  const sleep6 = await takeSamples(6, sampleCount);
+  if (sleep6.blocked) {
+    // Ronda 1 positiva pero ronda 2 bloqueada por WAF
+    if (delta1 >= threshold) {
+      return {
+        vulnerable: true,
+        confidence: "normal",
+        signal: `[confianza normal — ${sampleCount} muestra(s)] Prueba conductual POSITIVA: SLEEP(3) Δ=${delta1.toFixed(1)}s. Confirmación SLEEP(6) bloqueada por WAF.`,
+      };
+    }
+    return {
+      vulnerable: null,
+      confidence: "reduced",
+      signal:
+        "El WAF bloqueó la confirmación SLEEP(6). No se pudo completar la prueba.",
+    };
+  }
+  if (sleep6.times.length < (sampleCount > 1 ? 2 : 1)) {
+    if (delta1 >= threshold) {
+      return {
+        vulnerable: true,
+        confidence: "normal",
+        signal: `[confianza normal — ${sampleCount} muestra(s)] Prueba conductual POSITIVA: SLEEP(3) Δ=${delta1.toFixed(1)}s. Confirmación SLEEP(6) no disponible — muestras insuficientes.`,
+      };
+    }
+    return {
+      vulnerable: null,
+      confidence: "reduced",
+      signal:
+        "Prueba conductual no disponible: muestras SLEEP(6) insuficientes.",
+    };
+  }
+  const sleep6Median = median(sleep6.times);
+
+  const delta2 = (sleep6Median - base2Median) / 1000;
+  const scalingRatio = delta2 / Math.max(delta1, 0.1);
+
+  // Ambas rondas negativas → no vulnerable
+  if (delta1 < threshold && delta2 < threshold * 2) {
+    return {
+      vulnerable: false,
+      confidence: "high",
+      signal: `[confianza alta — ${sampleCount}+${sampleCount} muestras] Prueba conductual negativa: SLEEP(3) Δ=${delta1.toFixed(1)}s, SLEEP(6) Δ=${delta2.toFixed(1)}s. Ambos sin diferencia significativa.`,
     };
   }
 
+  // Ronda 1 positiva + ronda 2 confirma con escalamiento proporcional
+  if (
+    delta1 >= threshold &&
+    delta2 >= threshold * 2 &&
+    scalingRatio >= 1.5 &&
+    scalingRatio <= 3.0
+  ) {
+    return {
+      vulnerable: true,
+      confidence: "high",
+      signal: `[confianza alta — ${sampleCount}+${sampleCount} muestras] Prueba conductual CONFIRMADA: SLEEP(3) Δ=${delta1.toFixed(1)}s, SLEEP(6) Δ=${delta2.toFixed(1)}s (ratio ${scalingRatio.toFixed(2)}). El sitio ES vulnerable.`,
+    };
+  }
+
+  // Ronda 1 positiva pero ronda 2 no escala proporcionalmente
+  if (delta1 >= threshold) {
+    return {
+      vulnerable: true,
+      confidence: "normal",
+      signal: `[confianza normal — ${sampleCount} muestra(s)] Prueba conductual POSITIVA: SLEEP(3) Δ=${delta1.toFixed(1)}s. Confirmación SLEEP(6) no escaló proporcionalmente (Δ=${delta2.toFixed(1)}s, ratio ${scalingRatio.toFixed(2)}). Posible jitter de red.`,
+    };
+  }
+
+  // Ronda 1 negativa pero ronda 2 positiva (inconsistente)
   return {
-    vulnerable: false,
-    signal: `[confianza reducida — muestra única] Prueba conductual negativa: sin diferencia de tiempo significativa (SLEEP 3 → ${(injectResult.time / 1000).toFixed(1)}s, ref → ${(baseResult.time / 1000).toFixed(1)}s, Δ=${delta.toFixed(1)}s). El sitio parece estar parcheado.`,
+    vulnerable: null,
+    confidence: "reduced",
+    signal: `Prueba conductual inconclusa: SLEEP(3) Δ=${delta1.toFixed(1)}s (negativo) pero SLEEP(6) Δ=${delta2.toFixed(1)}s (positivo). Resultados inconsistentes.`,
   };
 }
 
@@ -783,7 +905,7 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
 
   // Prueba conductual (SLEEP oracle): siempre que el batch sea accesible.
   // La versión es señal corroborante, no motivo para saltarse la confirmación activa.
-  let behavioralResult: { vulnerable: boolean | null; signal: string } | null = null;
+  let behavioralResult: { vulnerable: boolean | null; signal: string; confidence: "high" | "normal" | "reduced" } | null = null;
   if (batch.accessible) {
     behavioralResult = await behavioralCheck(baseUrl, fetchFn);
     if (behavioralResult.signal) signals.push(behavioralResult.signal);

@@ -327,6 +327,22 @@ export function ScanReport({ result, onRunAgain }: ScanReportProps) {
               }
             >
               {result.behavioral.signal}
+              {" · "}
+              <span
+                className={
+                  result.behavioral.confidence === "high"
+                    ? "text-success"
+                    : result.behavioral.confidence === "normal"
+                      ? "text-warning"
+                      : "text-muted-foreground"
+                }
+              >
+                confianza {result.behavioral.confidence === "high"
+                  ? "alta"
+                  : result.behavioral.confidence === "normal"
+                    ? "normal"
+                    : "reducida"}
+              </span>
             </span>
           </InfoRow>
         )}
