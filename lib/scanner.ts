@@ -629,13 +629,13 @@ async function behavioralCheck(
   if (delta >= threshold) {
     return {
       vulnerable: true,
-      signal: `Prueba conductual POSITIVA: SLEEP(3) tardó ${(tInjected / 1000).toFixed(1)}s vs ${(tBase / 1000).toFixed(1)}s de referencia (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio ES vulnerable.`,
+      signal: `[confianza reducida — muestra única] Prueba conductual POSITIVA: SLEEP(3) tardó ${(tInjected / 1000).toFixed(1)}s vs ${(tBase / 1000).toFixed(1)}s de referencia (Δ=${delta.toFixed(1)}s, umbral ${threshold}s). El sitio ES vulnerable.`,
     };
   }
 
   return {
     vulnerable: false,
-    signal: `Prueba conductual negativa: sin diferencia de tiempo significativa (SLEEP 3 → ${(tInjected / 1000).toFixed(1)}s, ref → ${(tBase / 1000).toFixed(1)}s, Δ=${delta.toFixed(1)}s). El sitio parece estar parcheado.`,
+    signal: `[confianza reducida — muestra única] Prueba conductual negativa: sin diferencia de tiempo significativa (SLEEP 3 → ${(tInjected / 1000).toFixed(1)}s, ref → ${(tBase / 1000).toFixed(1)}s, Δ=${delta.toFixed(1)}s). El sitio parece estar parcheado.`,
   };
 }
 
@@ -764,10 +764,10 @@ export async function runScan(baseUrl: string, fetchFn: SafeFetch): Promise<Scan
     );
   }
 
-  // Prueba conductual (SLEEP oracle): solo cuando el batch es accesible y no
-  // tenemos una versión fiable — evita ejecutar SQL innecesario en sitios claramente safe.
+  // Prueba conductual (SLEEP oracle): siempre que el batch sea accesible.
+  // La versión es señal corroborante, no motivo para saltarse la confirmación activa.
   let behavioralResult: { vulnerable: boolean | null; signal: string } | null = null;
-  if (batch.accessible && (!detectedVersion || versionLt(detectedVersion, [6, 9, 0]))) {
+  if (batch.accessible) {
     behavioralResult = await behavioralCheck(baseUrl, fetchFn);
     if (behavioralResult.signal) signals.push(behavioralResult.signal);
   }
